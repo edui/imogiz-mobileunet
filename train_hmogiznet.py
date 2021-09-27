@@ -17,7 +17,6 @@ from torch.autograd import Variable
 from dataset import MogizDataset, get_img_files
 from loss import dice_loss
 from nets.MobileNetV2_unet import MobileNetV2_unet
-from trainer import Trainer
 from torch.utils.mobile_optimizer import optimize_for_mobile
 
 np.random.seed(1)
@@ -30,7 +29,7 @@ BATCH_SIZE = 8
 BATCH_SIZE = 16
 LR = 1e-3
 
-N_EPOCHS = 100
+N_EPOCHS = 1000
 IMG_SIZE = 224
 #IMG_SIZE = 128
 RANDOM_STATE = 1
@@ -40,20 +39,24 @@ OUT_DIR = 'outputs/{}'.format(EXPERIMENT)
 
 ds_dir = '/content/drive/MyDrive/Research/mogiz/Dataset/resized_128/'
 ds_dir = '/content/drive/MyDrive/Research/mogiz/Dataset/square_224/'
+ds_dir = 'data/square_224/'
+
 train_ds_name = 'TRAINING.csv'
 val_ds_name = 'TRAINING.csv'
 
+train_ds_name = 'TRAINING-90.csv'
+val_ds_name = 'VALIDATION-90.csv'
 # %%
 
 
 def get_data_loaders(ds_dir, train_ds_name, val_ds_name, img_size=224):
     train_transform = Compose([
-        # ColorJitter(0.3, 0.3, 0.3, 0.3),
+        ColorJitter(0.3, 0.3, 0.3, 0.3),
         Resize((img_size, img_size)),
         # RandomResizedCrop(img_size, scale=(1.0, 1.0)),
-        # RandomAffine(10.),
-        # RandomRotation(13.),
-        # RandomHorizontalFlip(),
+        RandomAffine(10.),
+        RandomRotation(13.),
+        RandomHorizontalFlip(),
         ToTensor(),
         Normalize(
             mean=[0.485, 0.456, 0.406],
@@ -78,6 +81,9 @@ def get_data_loaders(ds_dir, train_ds_name, val_ds_name, img_size=224):
 
     mask_transform = Compose([
         Resize((img_size, img_size)),
+        RandomAffine(10.),
+        RandomRotation(13.),
+        RandomHorizontalFlip(),
         ToTensor(),
     ])
 
@@ -85,20 +91,27 @@ def get_data_loaders(ds_dir, train_ds_name, val_ds_name, img_size=224):
                               batch_size=BATCH_SIZE,
                               shuffle=True,
                               pin_memory=True,
-                              num_workers=2)
+                              num_workers=3)
     val_loader = DataLoader(MogizDataset(ds_dir, val_ds_name, val_transform, mask_transform=mask_transform),
                             batch_size=BATCH_SIZE,
                             shuffle=False,
                             pin_memory=True,
-                            num_workers=2)
+                            num_workers=3)
 
     return train_loader, val_loader
 
 
 def save_best_model(cv, model, df_hist):
+    format_name = '{}-{}-{}'
     if df_hist['val_loss'].tail(1).iloc[0] <= df_hist['val_loss'].min():
-        torch.save(model.state_dict(), '{}/{}-best.pth'.format(OUT_DIR, cv))
+        best_name = format_name.format(0, str(BATCH_SIZE)+'b', 'lr'+str(LR))
+        torch.save(model.state_dict(),
+                   '{}/{}-best.pth'.format(OUT_DIR, best_name))
         # save_to_mobile(model)
+    if(cv % 200 == 0):
+        best_name = format_name.format(cv, str(BATCH_SIZE)+'b', 'lr'+str(LR))
+        df_hist.to_csv(
+            '{}/{}-hist.csv'.format(OUT_DIR, best_name), index=False)
 
 
 def save_to_mobile(model):
@@ -108,8 +121,7 @@ def save_to_mobile(model):
     torchscript_model_optimized = optimize_for_mobile(torchscript_model)
     torch.jit.save(torchscript_model_optimized,
                    '{}/{}-best.pt'.format(OUT_DIR, 0))
-    torchscript_model_optimized._save_for_lite_interpreter(
-        '{}/{}-best.ptl'.format(OUT_DIR, 0))
+    #torchscript_model_optimized._save_for_lite_interpreter('{}/{}-best.ptl'.format(OUT_DIR, 0))
 
 
 def write_on_board(writer, df_hist):
@@ -119,6 +131,10 @@ def write_on_board(writer, df_hist):
         'train': row.train_loss,
         'val': row.val_loss,
     }, row.epoch)
+
+    if(row.epoch % 10 == 0):
+        print("epoch : ", str(row.epoch), " | train: ",
+              row.train_loss, "val: ", row.val_loss)
 
 
 def log_hist(df_hist):
@@ -147,6 +163,8 @@ def run_training(img_size, pre_trained=None, loss='mse'):
     print("---")
     print("train images: ", str(train_num))
     print("epoch : ", str(epoch_num))
+    print("batch size : ", str(BATCH_SIZE))
+    print("LR : ", str(LR))
     print("---")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -155,6 +173,10 @@ def run_training(img_size, pre_trained=None, loss='mse'):
     model.to(device)
     optimizer = Adam(model.parameters(), lr=LR)
     criterion = dice_loss(scale=2)
+
+    decayRate = 0.96
+    my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer=optimizer, gamma=decayRate)
 
     if loss == 'mse':
         height_loss = nn.MSELoss()
@@ -171,18 +193,22 @@ def run_training(img_size, pre_trained=None, loss='mse'):
     history = []
 
     for epoch in range(0, epoch_num):
-        train_epoch_loss = _train_on_epoch(
+        train_epoch_loss, train_epoch_acc = _train_on_epoch(
             data_train, model, optimizer, criterion, height_loss,  weight_loss, device)
-        val_epoch_loss = _val_on_epoch(
+        val_epoch_loss, val_epoch_acc = _val_on_epoch(
             data_validation, model, optimizer, criterion, height_loss,  weight_loss, device)
+        my_lr_scheduler.step()
+
         hist = {
             'epoch': epoch,
             'train_loss': train_epoch_loss,
             'val_loss': val_epoch_loss,
+            'train_acc': train_epoch_acc,
+            'val_acc': val_epoch_acc,
         }
         history.append(hist)
 
-        on_after_epoch(0, writer, model, pd.DataFrame(history))
+        on_after_epoch(epoch, writer, model, pd.DataFrame(history))
 
     hist = pd.DataFrame(history)
     hist.to_csv('{}/{}-hist.csv'.format(OUT_DIR, epoch_num), index=False)
@@ -192,6 +218,7 @@ def run_training(img_size, pre_trained=None, loss='mse'):
 def _train_on_epoch(data_loader, model, optimizer, criterion, height_loss, weight_loss, device):
     model.train()
     running_loss = 0.0
+    correct_train = 0.0
 
     for _, data in enumerate(data_loader):
         inputs, labels, joints = data['i'], data['l'], data['j']
@@ -218,15 +245,18 @@ def _train_on_epoch(data_loader, model, optimizer, criterion, height_loss, weigh
             optimizer.step()
 
         running_loss += loss.item() * inputs.size(0)
+        correct_train += (y_height == height_o).sum().item()
 
+    train_acc = (100 * correct_train) / len(data_loader.dataset)
     epoch_loss = running_loss / len(data_loader.dataset)
 
-    return epoch_loss
+    return epoch_loss, train_acc
 
 
 def _val_on_epoch(data_loader, model, optimizer, criterion, height_loss, weight_loss, device):
     model.eval()
     running_loss = 0.0
+    correct_val = 0.0
 
     for _, data in enumerate(data_loader):
 
@@ -250,10 +280,12 @@ def _val_on_epoch(data_loader, model, optimizer, criterion, height_loss, weight_
             loss = loss_m + loss_h
 
         running_loss += loss.item() * inputs.size(0)
+        correct_val += (y_height == height_o).sum().item()
 
+    val_acc = (100 * correct_val) / len(data_loader.dataset)
     epoch_loss = running_loss / len(data_loader.dataset)
 
-    return epoch_loss
+    return epoch_loss, val_acc
 
 
 def manual_loss(probs1, target):

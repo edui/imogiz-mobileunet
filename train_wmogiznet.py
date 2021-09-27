@@ -152,6 +152,10 @@ def run_training(img_size, pre_trained, loss='mse'):
     optimizer = Adam(model.parameters(), lr=LR)
     criterion = dice_loss(scale=2)
 
+    decayRate = 0.96
+    my_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer=optimizer, gamma=decayRate)
+
     if loss == 'mse':
         height_loss = nn.MSELoss()
         weight_loss = nn.MSELoss()
@@ -171,6 +175,8 @@ def run_training(img_size, pre_trained, loss='mse'):
             data_train, model, optimizer, criterion, height_loss,  weight_loss, device)
         val_epoch_loss = _val_on_epoch(
             data_validation, model, optimizer, criterion, height_loss,  weight_loss, device)
+        my_lr_scheduler.step()
+
         hist = {
             'epoch': epoch,
             'train_loss': train_epoch_loss,
